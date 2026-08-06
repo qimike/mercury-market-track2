@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mercury-market": {
+      "command": "npx",
+      "args": ["tsx", "src/mcp/server.ts"],
+      "env": {
+        "MERCURY_AUTONOMOUS_REFUND_LIMIT": "${MERCURY_AUTONOMOUS_REFUND_LIMIT:-150.00}",
+        "MERCURY_MANDATORY_ESCALATION_LIMIT": "${MERCURY_MANDATORY_ESCALATION_LIMIT:-500.00}",
+        "MERCURY_MAX_TOOL_RETRIES": "${MERCURY_MAX_TOOL_RETRIES:-2}"
+      }
+    }
+  }
+}
