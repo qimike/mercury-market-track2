@@ -269,11 +269,11 @@ on repeat turns. The full raw result always stays in `CaseContext.auditTrail`.
 
 ```mermaid
 flowchart LR
-    MAIN["Main customer session\n(case + trace ID)"] -->|forkSession| FORK["Policy investigation fork\n(read-only MCP connection)"]
-    FORK -->|inspect multiple policy\nversions / SKUs| EVAL["evaluate_policy ×N"]
+    MAIN["Main customer session<br/>(case + trace ID)"] -->|forkSession| FORK["Policy investigation fork<br/>(read-only MCP connection)"]
+    FORK -->|inspect multiple policy<br/>versions / SKUs| EVAL["evaluate_policy ×N"]
     EVAL --> CONFLICT{Conflict?}
     CONFLICT --> FINDING["Structured PolicyInvestigationFinding"]
-    FINDING -.->|mergePolicyFindingIntoParent\n(explicit, not automatic)| MAIN
+    FINDING -.->|mergePolicyFindingIntoParent<br/>(explicit, not automatic)| MAIN
 ```
 
 A fork shares its parent's `caseId`/`traceId` for correlation but gets a **separate MCP
