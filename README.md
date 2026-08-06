@@ -101,30 +101,20 @@ tools are usable by any MCP client, including Claude Code itself via `.mcp.json`
 `src/agent/loop.ts`'s `AgentLoop` implements the loop exactly:
 
 ```mermaid
-sequenceDiagram
-    participant Claude
-    participant Loop as AgentLoop
-    participant Hooks
-    participant MCP as MCP tools
-
-    loop until terminal or max iterations
-        Loop->>Claude: messages + tool defs
-        Claude-->>Loop: response (text and/or tool_use blocks)
-        alt tool_use present
-            Loop->>Hooks: runPreToolHooks(name, input, ctx)
-            alt blocked
-                Hooks-->>Loop: structured error (no MCP call)
-            else allowed
-                Loop->>MCP: call tool (bounded retry if retryable)
-                MCP-->>Loop: ToolResult<T>
-            end
-            Loop->>Loop: duplicate-call check, CaseContext.ingest()
-            Loop->>Claude: tool_result(s)
-        else end_turn, no terminal tool yet
-            Loop->>Claude: "call resolve_case or escalate_to_human"
-        end
-    end
-    Loop->>Loop: finalize() — fail-safe escalation if not already resolved/escalated
+flowchart TD
+    A["Start loop"] --> B["Send messages + tool defs to Claude"]
+    B --> C["Receive response"]
+    C --> D{Tool use present?}
+    D -->|Yes| E["Run pre-tool hooks"]
+    E --> F{Blocked?}
+    F -->|Yes| G["Return structured error"]
+    F -->|No| H["Call MCP tool"]
+    H --> I["Validate and ingest result"]
+    I --> J["Send tool_result back"]
+    J --> B
+    D -->|No| K["Prompt for resolve_case or escalate_to_human"]
+    K --> L["Finalize with fail-safe escalation"]
+    G --> L
 ```
 
 1. Send the conversation + tool defs to Claude.
