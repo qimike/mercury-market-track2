@@ -59,9 +59,9 @@ flowchart TB
 
     CLI --> COORD
     COORD -->|delegate_to_identity_subagent| ID
-    COORD -->|delegate_to_order_subagent\ndelegate_to_policy_subagent\n(parallel, read-only)| ORD
+    COORD -->|delegate_to_order_subagent<br/>delegate_to_policy_subagent<br/>(parallel, read-only)| ORD
     COORD --> POL
-    COORD -->|delegate_to_refund_subagent\n(after identity+order+policy)| REF
+    COORD -->|delegate_to_refund_subagent<br/>(after identity+order+policy)| REF
     ID --> HOOKS
     ORD --> HOOKS
     POL --> HOOKS
