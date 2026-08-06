@@ -59,9 +59,9 @@ flowchart TB
 
     CLI --> COORD
     COORD -->|delegate_to_identity_subagent| ID
-    COORD -->|delegate_to_order_subagent<br/>delegate_to_policy_subagent<br/>(parallel, read-only)| ORD
+    COORD -->|delegate to order/policy| ORD
     COORD --> POL
-    COORD -->|delegate_to_refund_subagent<br/>(after identity+order+policy)| REF
+    COORD -->|delegate refund| REF
     ID --> HOOKS
     ORD --> HOOKS
     POL --> HOOKS
@@ -259,11 +259,11 @@ on repeat turns. The full raw result always stays in `CaseContext.auditTrail`.
 
 ```mermaid
 flowchart LR
-    MAIN["Main customer session<br/>(case + trace ID)"] -->|forkSession| FORK["Policy investigation fork<br/>(read-only MCP connection)"]
-    FORK -->|inspect multiple policy<br/>versions / SKUs| EVAL["evaluate_policy ×N"]
+    MAIN["Main session"] -->|forkSession| FORK["Policy fork"]
+    FORK -->|inspect policy| EVAL["evaluate_policy ×N"]
     EVAL --> CONFLICT{Conflict?}
-    CONFLICT --> FINDING["Structured PolicyInvestigationFinding"]
-    FINDING -.->|mergePolicyFindingIntoParent<br/>(explicit, not automatic)| MAIN
+    CONFLICT --> FINDING["Structured PolicyFinding"]
+    FINDING -.->|merge finding| MAIN
 ```
 
 A fork shares its parent's `caseId`/`traceId` for correlation but gets a **separate MCP
