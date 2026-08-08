@@ -10,7 +10,7 @@
  * enforcement never depends on which "agent" happens to be talking.
  */
 
-import type { ClaudeClient } from "./claudeClient.js";
+import type { ClaudeClient, ClaudeMessageParam } from "./claudeClient.js";
 import type { MercuryMcpConnection } from "./mcpClient.js";
 import { AgentLoop, type LocalToolSpec, type LoopResult } from "./loop.js";
 import { CaseContext } from "./context.js";
@@ -19,7 +19,7 @@ import { ok, fail } from "../domain/errors.js";
 import { runIdentitySubagent } from "./subagents/identity.js";
 import { runOrderSubagent } from "./subagents/order.js";
 import { runPolicySubagent } from "./subagents/policy.js";
-import { runRefundSubagent } from "./subagents/refund.js";
+import { runResolutionSubagent } from "./subagents/resolution.js";
 
 function buildDelegateTools(claude: ClaudeClient, mcp: MercuryMcpConnection): LocalToolSpec[] {
   return [
@@ -117,15 +117,17 @@ function buildDelegateTools(claude: ClaudeClient, mcp: MercuryMcpConnection): Lo
       },
     },
     {
-      name: "delegate_to_refund_subagent",
+      name: "delegate_to_resolution_subagent",
       description:
-        "Delegates to the Refund subagent: validates amount/currency/balance against the policy " +
-        "decision already established, and executes the refund if and only if appropriate. Only " +
-        "call this AFTER delegate_to_identity_subagent, delegate_to_order_subagent, and " +
-        "delegate_to_policy_subagent have all returned. Side-effecting.",
+        "Delegates to the Resolution-proposal specialist: drafts a PROPOSED remedy for one issue " +
+        "given the policy decision already established. Read-only (get_payment_history only) — this " +
+        "specialist cannot execute create_return or process_refund under any circumstance. Call this " +
+        "AFTER delegate_to_identity_subagent, delegate_to_order_subagent, and " +
+        "delegate_to_policy_subagent have returned for that issue.",
       input_schema: {
         type: "object",
         properties: {
+          issueId: { type: "string" },
           orderId: { type: "string" },
           customerId: { type: "string" },
           requestedAmount: { type: "string" },
@@ -134,11 +136,12 @@ function buildDelegateTools(claude: ClaudeClient, mcp: MercuryMcpConnection): Lo
           policyConfidence: { type: "string", enum: ["high", "medium", "low"] },
           reason: { type: "string" },
         },
-        required: ["orderId", "customerId", "requestedAmount", "currency", "policyDecision", "policyConfidence", "reason"],
+        required: ["issueId", "orderId", "customerId", "requestedAmount", "currency", "policyDecision", "policyConfidence", "reason"],
       },
-      sideEffecting: true,
+      sideEffecting: false,
       handler: async (input, context) => {
-        const finding = await runRefundSubagent(claude, mcp, context, {
+        const finding = await runResolutionSubagent(claude, mcp, context, {
+          issueId: String(input.issueId),
           orderId: String(input.orderId),
           customerId: String(input.customerId),
           requestedAmount: String(input.requestedAmount),
@@ -150,8 +153,8 @@ function buildDelegateTools(claude: ClaudeClient, mcp: MercuryMcpConnection): Lo
         if (!finding) {
           return fail(
             "DEPENDENCY",
-            "REFUND_SUBAGENT_DID_NOT_CONVERGE",
-            "The Refund subagent hit its iteration/duplicate-call safety valve without reporting a finding.",
+            "RESOLUTION_SUBAGENT_DID_NOT_CONVERGE",
+            "The Resolution specialist hit its iteration/duplicate-call safety valve without reporting a finding.",
             true
           );
         }
@@ -167,9 +170,11 @@ export async function runCoordinator(options: {
   caseId: string;
   traceId: string;
   initialUserMessage: string;
+  /** Seeds the conversation from a prior session's transcript (spec section 23 resume). */
+  resumeTranscript?: ClaudeMessageParam[];
 }): Promise<LoopResult> {
   const context = new CaseContext(options.caseId, options.traceId);
   const delegateTools = buildDelegateTools(options.claude, options.mcp);
   const loop = new AgentLoop(options.claude, options.mcp, COORDINATOR_SYSTEM_PROMPT, context, delegateTools);
-  return loop.run(options.initialUserMessage);
+  return loop.run(options.initialUserMessage, options.resumeTranscript ?? []);
 }

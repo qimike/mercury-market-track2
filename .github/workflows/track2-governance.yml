@@ -1,0 +1,50 @@
+name: Track 2 governance
+
+on:
+  pull_request:
+  push:
+    branches: [main, track2-advisor-governance]
+
+# Least-privilege by default (spec section 37) — contents:read is enough
+# for build/test/governance; nothing here needs write access to the repo,
+# issues, or packages.
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # governance diffing needs the base commit, not a shallow clone
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit + integration + scenario + governance + security tests
+        run: npm test
+
+      - name: Deterministic + model-assisted governance review
+        # Never receives secrets on a pull_request from a fork — GITHUB_TOKEN
+        # here is read-only per the `permissions` block above, and no
+        # ANTHROPIC_API_KEY is passed to untrusted-PR runs. The model-assisted
+        # step inside governance:ci degrades to deterministic-only when the
+        # `claude` CLI or credentials are unavailable (see src/governance/ciReview.ts).
+        run: npm run governance:ci
+
+      - name: Upload governance findings artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: governance-findings
+          path: .governance/prior-findings.json
+          if-no-files-found: ignore

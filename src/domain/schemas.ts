@@ -81,37 +81,10 @@ export const LineItemSchema = z.object({
 });
 export type LineItem = z.infer<typeof LineItemSchema>;
 
-/**
- * Case Facts — the persisted, structured record of what is known about a case.
- * This is the object carried across turns/sessions (see src/agent/context.ts)
- * instead of raw tool payloads.
- */
-export const CaseFactsSchema = z.object({
-  caseId: z.string(),
-  customerId: z.string(),
-  identityStatus: z.enum(["unverified", "verified", "locked"]),
-  issueType: z.enum([
-    "return",
-    "billing_dispute",
-    "account_issue",
-    "refund_request",
-    "order_issue",
-    "policy_question",
-  ]),
-  region: z.string(),
-  currency: z.string().length(3),
-  orderId: z.string().nullable(),
-  relevantDates: z.object({
-    orderDate: z.string().nullable(),
-    deliveryDate: z.string().nullable(),
-    requestDate: z.string(),
-  }),
-  requestedAmount: MoneySchema.nullable(),
-  lineItems: z.array(LineItemSchema),
-  reason: z.string(),
-  knownAmbiguities: z.array(z.string()),
-});
-export type CaseFacts = z.infer<typeof CaseFactsSchema>;
+// NOTE: the persisted, structured case-facts record is
+// src/domain/schemas/advisorCaseFacts.ts's AdvisorCaseFactsSchema (spec
+// section 15) — it replaces this module's original CaseFactsSchema, which
+// had no way to distinguish a customer claim from a verified fact.
 
 export const RiskFlagSchema = z.enum([
   "high_value",
@@ -186,34 +159,6 @@ export const PolicyEvaluationResultSchema = z.object({
 });
 export type PolicyEvaluationResult = z.infer<typeof PolicyEvaluationResultSchema>;
 
-export const RefundDecisionSchema = z.object({
-  routing: z.enum(["autonomous", "escalate"]),
-  reason: z.string(),
-  amount: MoneySchema,
-  requiresIdempotencyKey: z.boolean(),
-});
-export type RefundDecision = z.infer<typeof RefundDecisionSchema>;
-
-/**
- * Resolution — the structured, schema-enforced output for a case the
- * coordinator resolves autonomously (never emitted via free text). Every
- * amount/citation/transaction id here is cross-checked by
- * src/agent/validation.ts against what was actually retrieved this case
- * before the loop accepts it as terminal.
- */
-export const ResolutionSchema = z.object({
-  caseId: z.string(),
-  outcome: z.literal("resolved_autonomously"),
-  customerSummary: z.string().min(1),
-  internalSummary: z.string().min(1),
-  refundTransactionId: z.string().nullable(),
-  refundAmount: MoneySchema.nullable(),
-  policyCitations: z.array(PolicyCitationSchema),
-  actionsTaken: z.array(z.string()),
-  provenance: z.array(ProvenanceSchema),
-});
-export type Resolution = z.infer<typeof ResolutionSchema>;
-
 /**
  * Subagent finding schemas. Each subagent's nested loop (src/agent/subagentLoop.ts)
  * terminates by calling its own `submit_*_finding` tool, enforced via the same
@@ -254,12 +199,9 @@ export const PolicyFindingSchema = z.object({
 });
 export type PolicyFinding = z.infer<typeof PolicyFindingSchema>;
 
-export const RefundFindingSchema = z.object({
-  caseId: z.string(),
-  routing: z.enum(["autonomous", "escalate", "not_applicable"]),
-  refundTransactionId: z.string().nullable(),
-  amount: MoneySchema.nullable(),
-  reason: z.string(),
-  blockedReason: z.string().nullable(),
-});
-export type RefundFinding = z.infer<typeof RefundFindingSchema>;
+// NOTE: the Refund specialist's finding schema is
+// src/domain/schemas/proposalFinding.ts's ProposalFindingSchema — it
+// replaces this module's original RefundFindingSchema, which reported an
+// already-executed refund (routing: "autonomous"). Track 2's Resolution
+// specialist has no ability to execute anything, so its finding is always a
+// proposal.

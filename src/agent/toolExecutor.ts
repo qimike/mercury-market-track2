@@ -57,7 +57,7 @@ export async function executeTool(
     attempts += 1;
     result = await connection.callTool(toolName, finalInput);
     if (result.success) break;
-    const retryable = result.error.isRetryable && attempts <= config.maxToolRetries;
+    const retryable = result.error.isRetryable && attempts <= config.maxRetries;
     if (!retryable) break;
     await sleep(backoffMs(attempts));
   }

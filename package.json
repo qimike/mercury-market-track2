@@ -1,8 +1,8 @@
 {
-  "name": "mercury-market-resolution-platform",
+  "name": "mercury-market-track2-governance",
   "version": "0.1.0",
   "private": true,
-  "description": "Agent-first customer resolution platform for Mercury Market (Track 1)",
+  "description": "Human-in-the-loop advisor and CI governance for Mercury Market (Track 2)",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -13,8 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "mcp:server": "tsx src/mcp/server.ts",
-    "agent:cli": "tsx src/cli.ts",
-    "eval": "tsx src/eval/runEval.ts"
+    "advisor:cli": "tsx src/cli/index.ts",
+    "governance:ci": "tsx src/governance/ciReview.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",

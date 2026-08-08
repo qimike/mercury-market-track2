@@ -39,9 +39,10 @@ export class CaseContext {
   readonly openQuestions: string[] = [];
   readonly auditTrail: ToolCallOutcome[] = [];
 
+  /** Terminal state for the advisor loop — "resolved" here means "packet submitted," never "action executed." */
   escalationStatus: "none" | "escalated" | "resolved" = "none";
   escalationId: string | null = null;
-  resolutionOutcome: "resolved_autonomously" | null = null;
+  suggestionId: string | null = null;
 
   constructor(
     readonly caseId: string,
@@ -52,7 +53,6 @@ export class CaseContext {
     return {
       caseId: this.caseId,
       identityStatus: this.identityStatus,
-      knownRemainingRefundableAmount: this.knownRemainingRefundableAmount ?? undefined,
       caseCurrency: this.currency ?? undefined,
       policyDecision: this.policyDecision ?? undefined,
       policyConfidence: this.policyConfidence ?? undefined,
@@ -140,30 +140,21 @@ export class CaseContext {
         }
         break;
       }
-      case "create_return": {
-        const record = data.returnRecord as { returnId: string } | undefined;
-        if (record) this.actionsTaken.push(`Return authorized: ${record.returnId}.`);
-        break;
-      }
-      case "process_refund": {
-        if (typeof data.transactionId === "string") {
-          this.seenTransactionIds.add(data.transactionId);
-          this.actionsTaken.push(
-            `Refund ${data.replayed ? "replayed (idempotent)" : "processed"}: ${data.transactionId} for ${data.amount} ${data.currency}.`
-          );
-        }
-        break;
-      }
-      // NOTE: escalate_to_human/resolve_case deliberately do NOT flip
-      // escalationStatus/resolutionOutcome here. Both are terminal, schema-
-      // validated-but-not-yet-semantically-validated at this point in the
-      // pipeline (see loop.ts's handleTerminalToolUse) — the caller sets
-      // status explicitly only once semantic validation has also passed, so
-      // a call that fails semantic validation and is later corrected on
-      // retry (or exhausts retries and triggers the fail-safe path) never
-      // gets treated as already resolved/escalated.
+      // NOTE: create_return/process_refund never appear here — the advisor's
+      // MCP connection can never call them (see src/mcp/authorization.ts);
+      // any execution happens on a separate connection/context entirely
+      // (src/approvals/execute.ts), outside the advisor's CaseContext.
+      //
+      // NOTE: escalate_to_human/submit_suggestion_packet deliberately do NOT
+      // flip escalationStatus here. Both are terminal, schema-validated-but-
+      // not-yet-semantically-validated at this point in the pipeline (see
+      // loop.ts's handleTerminalToolUse) — the caller sets status explicitly
+      // only once semantic validation has also passed, so a call that fails
+      // semantic validation and is later corrected on retry (or exhausts
+      // retries and triggers the fail-safe path) never gets treated as
+      // already resolved/escalated.
       case "escalate_to_human":
-      case "resolve_case":
+      case "submit_suggestion_packet":
         break;
       default:
         break;

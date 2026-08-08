@@ -11,6 +11,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMercuryMcpServer } from "../mcp/server.js";
 import { err, type ToolResult } from "../domain/errors.js";
+import type { Role } from "../domain/roles.js";
 
 export interface AnthropicToolDef {
   name: string;
@@ -29,9 +30,21 @@ export interface MercuryMcpConnection {
 export async function connectMercuryMcp(options: {
   traceId?: string;
   readOnlySession: boolean;
+  /**
+   * Defaults to "advisor_agent" — the only role src/agent's own loop ever
+   * uses. A "human_support_agent" connection is opened exclusively by
+   * src/approvals/execute.ts, never by the advisor loop itself.
+   */
+  callerRole?: Role;
+  sessionId?: string;
 }): Promise<MercuryMcpConnection> {
   const traceId = options.traceId ?? randomUUID();
-  const server = createMercuryMcpServer({ traceId, readOnlySession: options.readOnlySession });
+  const server = createMercuryMcpServer({
+    traceId,
+    readOnlySession: options.readOnlySession,
+    callerRole: options.callerRole ?? "advisor_agent",
+    sessionId: options.sessionId,
+  });
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "mercury-agent-loop", version: "0.1.0" });
 

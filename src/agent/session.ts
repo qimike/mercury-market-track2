@@ -33,9 +33,9 @@ export interface SessionRecord {
 export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>();
 
-  createSession(caseId: string, traceId: string = randomUUID()): SessionRecord {
+  createSession(caseId: string, traceId: string = randomUUID(), sessionId: string = randomUUID()): SessionRecord {
     const record: SessionRecord = {
-      sessionId: randomUUID(),
+      sessionId,
       caseId,
       traceId,
       parentSessionId: null,
@@ -47,6 +47,16 @@ export class SessionManager {
     };
     this.sessions.set(record.sessionId, record);
     return record;
+  }
+
+  /** For persistence adapters (e.g. the demo CLI) — never used by the advisor loop itself. */
+  listAll(): SessionRecord[] {
+    return [...this.sessions.values()];
+  }
+
+  /** For persistence adapters — restores previously-created records verbatim. */
+  loadAll(records: SessionRecord[]): void {
+    for (const record of records) this.sessions.set(record.sessionId, record);
   }
 
   getSession(sessionId: string): SessionRecord | undefined {

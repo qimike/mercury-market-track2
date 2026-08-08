@@ -16,10 +16,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { toolSpecs, type ToolContext } from "./toolDefinitions.js";
 import { resourceSpecs } from "./resourceDefinitions.js";
+import { isToolAllowedForRole, type Role } from "../domain/roles.js";
 
 export interface MercuryServerOptions {
   traceId: string;
+  /**
+   * Fixed for the lifetime of this server/connection instance — never derived
+   * from a tool call's input. See toolDefinitions.ts's module doc comment.
+   */
+  callerRole: Role;
   readOnlySession: boolean;
+  sessionId?: string;
 }
 
 export function createMercuryMcpServer(options: MercuryServerOptions): McpServer {
@@ -31,7 +38,14 @@ export function createMercuryMcpServer(options: MercuryServerOptions): McpServer
 
   let callCounter = 0;
 
+  // Role-scoped tool visibility (spec section 11): a tool this connection's
+  // role is never allowed to call isn't merely rejected at call time — it
+  // isn't even registered, so it can't appear in listTools() for that
+  // connection. src/mcp/authorization.ts still enforces the hard boundary
+  // independent of this (defense in depth if a spec ever adds a second way
+  // to enumerate tools), but this keeps the advisor's own tool list honest.
   for (const spec of toolSpecs) {
+    if (!isToolAllowedForRole(spec.name, options.callerRole)) continue;
     server.registerTool(
       spec.name,
       {
@@ -51,7 +65,9 @@ export function createMercuryMcpServer(options: MercuryServerOptions): McpServer
         callCounter += 1;
         const ctx: ToolContext = {
           traceId: options.traceId,
+          callerRole: options.callerRole,
           readOnlySession: options.readOnlySession,
+          sessionId: options.sessionId ?? options.traceId,
         };
         const result = await spec.handler(args, ctx);
         return {
@@ -80,6 +96,7 @@ export function createMercuryMcpServer(options: MercuryServerOptions): McpServer
 async function main(): Promise<void> {
   const server = createMercuryMcpServer({
     traceId: `stdio-${Date.now()}`,
+    callerRole: "advisor_agent",
     readOnlySession: false,
   });
   const transport = new StdioServerTransport();

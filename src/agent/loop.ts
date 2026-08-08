@@ -11,8 +11,8 @@
  *  4. execute + validate requested tools                  -> executeTool (hooks -> MCP -> retry)
  *  5. add tool results back into the conversation          -> messages.push({role:"user", content: toolResultBlocks})
  *  6. continue reasoning                                   -> loop
- *  7. terminate on end_turn or a terminal state            -> resolve_case / escalate_to_human
- *  8. enforce max iterations                               -> config.maxLoopIterations
+ *  7. terminate on end_turn or a terminal state            -> submit_suggestion_packet / escalate_to_human
+ *  8. enforce max iterations                               -> config.maxAgentSteps
  *  9. detect repeated/duplicate tool-call loops            -> signatureCounts
  * 10. preserve trace information across iterations         -> trace[]
  */
@@ -29,12 +29,14 @@ import type { MercuryMcpConnection } from "./mcpClient.js";
 import { executeTool, type ToolCallOutcome } from "./toolExecutor.js";
 import { CaseContext } from "./context.js";
 import {
-  validateResolution,
+  validateSuggestionPacket,
   validateEscalationPacket,
-  validateCaseFacts,
+  validateAdvisorCaseFacts,
   formatValidationErrorsForClaude,
 } from "./validation.js";
-import type { Resolution, EscalationPacket, CaseFacts } from "../domain/schemas.js";
+import type { EscalationPacket } from "../domain/schemas.js";
+import type { SuggestionPacket } from "../domain/schemas/suggestionPacket.js";
+import type { AdvisorCaseFacts } from "../domain/schemas/advisorCaseFacts.js";
 import { toolSpecs } from "../mcp/toolDefinitions.js";
 import { config } from "../domain/config.js";
 import type { ToolResult } from "../domain/errors.js";
@@ -70,9 +72,10 @@ export interface TraceEntry {
 }
 
 export interface LoopResult {
+  /** "resolved" here means "suggestion packet submitted for human review" — never "action executed." */
   outcome: "resolved" | "escalated";
   terminationReason:
-    | "resolve_case"
+    | "submit_suggestion_packet"
     | "escalate_to_human"
     | "max_iterations_exceeded"
     | "duplicate_tool_call_loop"
@@ -99,7 +102,7 @@ function toolResultBlock(toolUseId: string, content: unknown, isError: boolean):
   };
 }
 
-const TERMINAL_TOOLS = new Set(["resolve_case", "escalate_to_human"]);
+const TERMINAL_TOOLS = new Set(["submit_suggestion_packet", "escalate_to_human"]);
 
 export class AgentLoop {
   private readonly signatureCounts = new Map<string, number>();
@@ -138,15 +141,15 @@ export class AgentLoop {
     let iteration = 0;
     while (true) {
       iteration += 1;
-      if (iteration > config.maxLoopIterations) {
+      if (iteration > config.maxAgentSteps) {
         return this.finalize("max_iterations_exceeded", trace, messages, iteration);
       }
-      if (iteration === config.maxLoopIterations) {
+      if (iteration === config.maxAgentSteps) {
         messages.push({
           role: "user",
           content:
-            `This is your final turn before the loop's iteration limit (${config.maxLoopIterations}). ` +
-            "If the case is not fully resolved, call escalate_to_human now with whatever facts you have.",
+            `This is your final turn before the loop's step limit (${config.maxAgentSteps}). ` +
+            "If the suggestion packet is not ready, call escalate_to_human now with whatever facts you have.",
         });
       }
 
@@ -170,7 +173,7 @@ export class AgentLoop {
       if (toolUseBlocks.length === 0) {
         if (this.context.escalationStatus !== "none") {
           return this.finalize(
-            this.context.escalationStatus === "resolved" ? "resolve_case" : "escalate_to_human",
+            this.context.escalationStatus === "resolved" ? "submit_suggestion_packet" : "escalate_to_human",
             trace,
             messages,
             iteration
@@ -179,9 +182,9 @@ export class AgentLoop {
         messages.push({
           role: "user",
           content:
-            "Every case must end by calling either resolve_case (autonomous resolution) or " +
-            "escalate_to_human (handoff) — you have called neither yet. Continue working the case, " +
-            "or if you already have enough information, call one of those two tools now.",
+            "Every run must end by calling either submit_suggestion_packet (proposal ready for human " +
+            "review) or escalate_to_human (handoff) — you have called neither yet. Continue working the " +
+            "case, or if you already have enough information, call one of those two tools now.",
         });
         continue;
       }
@@ -196,7 +199,7 @@ export class AgentLoop {
         return this.finalize("structured_output_retry_exhausted", trace, messages, iteration);
       }
       if (terminal === "resolved") {
-        return this.finalize("resolve_case", trace, messages, iteration);
+        return this.finalize("submit_suggestion_packet", trace, messages, iteration);
       }
       if (terminal === "escalated") {
         return this.finalize("escalate_to_human", trace, messages, iteration);
@@ -269,14 +272,14 @@ export class AgentLoop {
         blockedByHook: outcome.blockedByHook,
       });
 
-      // record_case_facts is structured output too (spec section 11/12): schema
-      // validation already ran at the MCP layer; this is the semantic gate
-      // (line_item_refund_sum == requested_refund_total). Non-terminal — a
-      // failure here just becomes a tool_result error Claude can correct on
-      // its own next turn, bounded by the loop's own max-iteration/duplicate-
-      // call safety nets rather than a separate retry counter.
+      // record_case_facts is structured output too (spec section 18/19): schema
+      // validation already ran at the MCP layer; this is the semantic gate.
+      // Non-terminal — a failure here just becomes a tool_result error the
+      // model can correct on its own next turn, bounded by the loop's own
+      // max-iteration/duplicate-call safety nets rather than a separate
+      // retry counter.
       if (toolUse.name === "record_case_facts" && outcome.result.success) {
-        const semantic = validateCaseFacts(toolUse.input as CaseFacts);
+        const semantic = validateAdvisorCaseFacts(toolUse.input as AdvisorCaseFacts);
         if (!semantic.valid) {
           return toolResultBlock(toolUse.id, formatValidationErrorsForClaude(toolUse.name, semantic.errors), true);
         }
@@ -318,8 +321,8 @@ export class AgentLoop {
     }
 
     const semantic =
-      toolUse.name === "resolve_case"
-        ? validateResolution(toolUse.input as Resolution, this.context)
+      toolUse.name === "submit_suggestion_packet"
+        ? validateSuggestionPacket(toolUse.input as SuggestionPacket, this.context)
         : validateEscalationPacket(toolUse.input as EscalationPacket, this.context);
 
     if (!semantic.valid) {
@@ -330,19 +333,20 @@ export class AgentLoop {
       );
     }
 
-    // Only now — schema AND semantic validation both passed — does the case
+    // Only now — schema AND semantic validation both passed — does the run
     // actually count as resolved/escalated (see the comment in
-    // CaseContext.ingest's resolve_case/escalate_to_human cases).
-    if (toolUse.name === "resolve_case") {
-      this.context.resolutionOutcome = "resolved_autonomously";
+    // CaseContext.ingest's terminal-tool cases). "resolved" means the
+    // suggestion packet was accepted for human review — no action executed.
+    if (toolUse.name === "submit_suggestion_packet") {
       this.context.escalationStatus = "resolved";
+      this.context.suggestionId = (toolUse.input as SuggestionPacket).suggestionId;
     } else {
       this.context.escalationStatus = "escalated";
       const escalationId = (outcome.result as { escalationId?: string }).escalationId;
       if (escalationId) this.context.escalationId = escalationId;
     }
 
-    setTerminal(toolUse.name === "resolve_case" ? "resolved" : "escalated");
+    setTerminal(toolUse.name === "submit_suggestion_packet" ? "resolved" : "escalated");
     return toolResultBlock(toolUse.id, outcome.result, false);
   }
 
@@ -376,13 +380,15 @@ export class AgentLoop {
     if (this.context.escalationStatus === "none") {
       await this.fileFailSafeEscalation(reason);
     }
-    const outcome: LoopResult["outcome"] = this.context.resolutionOutcome === "resolved_autonomously" ? "resolved" : "escalated";
+    const outcome: LoopResult["outcome"] = this.context.escalationStatus === "resolved" ? "resolved" : "escalated";
     return { outcome, terminationReason: reason, iterations, trace, context: this.context, transcript };
   }
 
   private async fileFailSafeEscalation(reason: LoopResult["terminationReason"]): Promise<void> {
     const ctx = this.context;
     const packet = {
+      sessionId: ctx.traceId,
+      suggestionId: ctx.suggestionId,
       caseId: ctx.caseId,
       traceId: ctx.traceId,
       customerSummary:

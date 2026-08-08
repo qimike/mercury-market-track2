@@ -1,150 +1,183 @@
-# Mercury Market — Agent-First Customer Resolution Platform
+# Mercury Market Track 2 — Human-in-the-Loop Support Advisor & CI Governance
 
 This file governs how Claude Code should work in this repository. It is read
 alongside path-scoped `CLAUDE.md` files in `src/mcp/`, `src/agent/`, and
-`policies/`, which override/extend this file for their subtrees.
+`policies/`, and the rule files in `.claude/rules/`, which override/extend
+this file for their subtrees.
 
 ## What this project is
 
-A customer-support resolution agent for a mocked ecommerce retailer
-("Mercury Market") that autonomously handles returns, billing disputes,
-account issues, refund requests, order issues, and policy questions — and
-knows when to hand a case to a human instead of guessing. See `README.md`
-for the full architecture writeup; this file is about how to work *in* the
-code, not what the code does.
+An internal assistant that helps human support agents at a mocked ecommerce
+retailer ("Mercury Market") resolve returns, billing disputes, account
+issues, and refund requests — by analyzing a case, retrieving authorized
+data, evaluating policy, and producing a schema-validated **suggestion
+packet** for a human to approve, edit, or reject. **The advisor never
+executes a customer-affecting action itself.** Every refund or return is
+executed only by a separately authorized human-execution code path, after
+explicit approval tied to an exact content hash. CI/CD governance checks
+(deterministic first, model-assisted second) gate changes to policies,
+prompts, tool descriptions, schemas, and permissions.
+
+This repository was cloned from a separate, now-frozen Track 1 baseline
+(`docs/track2-baseline.md` records the exact commit) and rebuilt as a
+standalone platform — it is **not** a dual-mode repository, and no runtime
+path here resolves a case autonomously.
 
 ## Architecture at a glance
 
 - `src/domain/` — framework-free types: `Money` (integer minor units, never
-  floats), the structured `ToolError`/`ToolResult` model, zod schemas for
-  every structured output, and environment-driven `config` (thresholds).
+  floats), the structured `ToolError`/`ToolResult` model, `roles.ts` (the
+  role/permission table), and `schemas/` (SuggestionPacket, Rationale,
+  CiReview, AdvisorCaseFacts, ProposalFinding — all zod, all hash-stamped
+  where versioning matters).
 - `src/mock-backends/` — deterministic in-memory CRM/Identity/OMS/Payments/
-  Policy/Case-management systems. Seed data lives in `data.ts`; every
-  scenario in `src/eval/scenarios.ts` maps to specific seeded records.
-- `src/mcp/` — the real MCP server (`@modelcontextprotocol/sdk`): tool and
-  resource definitions, registered on an `McpServer`, served over stdio
-  (`.mcp.json`) or an in-memory transport (used by the agent itself).
-- `src/agent/` — the deterministic agentic loop (`loop.ts`), the smaller
-  per-subagent loop (`subagentLoop.ts`), programmatic safety hooks
-  (`hooks.ts`), the bounded-retry tool executor (`toolExecutor.ts`), case
-  context/provenance (`context.ts`), semantic validation (`validation.ts`),
-  session/fork management (`session.ts`), the coordinator (`coordinator.ts`),
-  and the four subagents (`subagents/`).
-- `src/eval/` — the deterministic "autopilot" fake model (`autopilot.ts`),
-  the 13 seeded scenarios (`scenarios.ts`), and the evaluation runner
-  (`runEval.ts`, `npm run eval`).
-- `src/feedback/` — human-in-the-loop feedback store and the agent-vs-human
-  comparison report.
+  Policy/CaseManagement/Returns/Ticketing/ApprovalQueue systems. Seed data
+  lives in `data.ts`.
+- `src/mcp/` — the MCP server (`@modelcontextprotocol/sdk`): `toolDefinitions.ts`
+  (tool contracts), `resourceDefinitions.ts` (read-only reference docs),
+  `server.ts` (role-scoped tool registration), `authorization.ts` (the
+  server-side gate on `process_refund`/`create_return`).
+- `src/agent/` — the underlying deterministic loop engine (loop.ts,
+  subagentLoop.ts, coordinator.ts, hooks.ts, toolExecutor.ts, context.ts,
+  validation.ts, session.ts, the four specialist subagents) — reused from
+  the Track 1 baseline but rewritten so there is no autonomous-execution
+  terminal state. The advisor's run always ends in exactly one of
+  `submit_suggestion_packet` or `escalate_to_human`.
+- `src/advisor/` — the advisor-facing entry point (`orchestrator.ts`),
+  derived internal `rationale.ts`, and `packetStore.ts` (suggestion-packet
+  version history).
+- `src/approvals/` — the human decision workflow: `store.ts` (approval
+  records), `decide.ts` (approve/edit/reject/revise, hash invalidation on
+  material edits), `revalidate.ts` (fresh-data re-check immediately before
+  execution), `execute.ts` (the **only** code path that ever opens a
+  `human_support_agent` MCP connection or calls `process_refund`/
+  `create_return`), `riskGate.ts` (tiered approval-count requirement).
+- `src/sessions/` — resume/fork (`index.ts`, re-exporting `src/agent/session.ts`)
+  and the typed investigation scratchpad (`scratchpad.ts`).
+- `src/audit/` — append-only audit-timeline aggregation (`auditLog.ts`).
+- `src/governance/` — deterministic CI checks (`deterministicChecks.ts`) and
+  the CI review orchestrator (`ciReview.ts`), including the (environment-
+  dependent, gracefully-degrading) model-assisted pass.
+- `src/cli/` — the demonstration CLI (`index.ts`).
 
-## Why a hand-rolled loop instead of `@anthropic-ai/claude-agent-sdk`'s `query()`
+## The safety boundary — read this before touching anything in src/mcp or src/approvals
 
-We evaluated the Claude Agent SDK directly. Its `query()` function is
-excellent for coding-agent workflows (file edits, bash, Task-tool subagents)
-but deliberately hides the per-iteration tool_use/tool_result loop inside the
-Claude Code CLI harness — you get a stream of `SDKMessage`s, not a point where
-you inspect a response and decide whether to continue. This project's spec
-requires exactly that level of control (inspect the response, enforce max
-iterations, detect duplicate tool calls, run programmatic hooks before a tool
-executes, run semantic validation with bounded correction retries). We
-therefore built the loop directly on `@anthropic-ai/sdk`'s Messages API
-(`src/agent/claudeClient.ts` + `src/agent/loop.ts`), and implement our own
-coordinator→subagent delegation (`src/agent/coordinator.ts`) that mirrors the
-Agent SDK's conceptual model (hooks, subagents, sessions, forks) while giving
-us the explicit control the spec asks for. We still build a real MCP server
-so the tools are usable by any MCP client (including Claude Code itself via
-`.mcp.json`).
+`process_refund` and `create_return` are refused **unconditionally** unless
+the calling MCP connection is bound to the `human_support_agent` role. A
+role is never a value a tool call can set — it is fixed once, at connection
+creation time, by trusted server code:
+
+- `src/agent/mcpClient.ts`'s `connectMercuryMcp()` always defaults to
+  `callerRole: "advisor_agent"`, and every advisor code path uses this
+  default.
+- `src/approvals/execute.ts` is the **only** call site in the whole
+  repository that ever passes `callerRole: "human_support_agent"`, and it
+  does so on a short-lived connection opened only to execute one already-
+  approved action.
+- `src/mcp/server.ts` doesn't even *register* a tool a role can't call
+  (`isToolAllowedForRole`) — an advisor connection's `listTools()` never
+  includes `process_refund`/`create_return` at all.
+- `src/mcp/authorization.ts` is the second, independent gate: even on a
+  `human_support_agent` connection, execution requires an on-file approval
+  record whose `suggestionHash`/`actionHash`/version match exactly, was not
+  copied from a forked session, and has not already been executed.
+
+**Never** add a code path that lets an `advisor_agent` connection execute a
+side effect "just this once," and never let a role be derived from tool
+input. If you need to change this boundary, that's a plan-first change (see
+below) — write the plan, get it reviewed, and update
+`tests/integration/mcpAuthorization.test.ts` alongside the code.
 
 ## Coding conventions
 
-- **Typed models everywhere.** Every tool input/output is a zod schema
-  (`src/domain/schemas.ts`, `src/mcp/toolDefinitions.ts`). Never pass loose
-  `any`/`Record<string, unknown>` across a module boundary if a typed shape
-  already exists for it.
+- **Typed models everywhere.** Every tool input/output and every artifact
+  that crosses a trust boundary (SuggestionPacket, Rationale, CiReview,
+  AdvisorCaseFacts) is a zod schema. Never pass loose `any`/
+  `Record<string, unknown>` across a module boundary if a typed shape
+  already exists.
 - **Money is never a `number`.** Use `src/domain/money.ts`'s `Money` type
   (integer minor units) and `parseMoney`/`formatMoney`. Decimal strings
-  ("42.50") are the only acceptable wire format. Never `parseFloat` a
-  monetary amount.
+  ("42.50") are the only acceptable wire format.
 - **Structured errors, not throws, across tool boundaries.** Mock backends
-  and MCP tools return `ToolResult<T>` (`src/domain/errors.ts`) — `{success:
-  true, ...}` or `{success: false, error: {...}}`. Reserve real `throw` for
-  truly unexpected internal bugs, not business-rule failures.
-- **Error propagation preserves the original error.** When wrapping a
-  lower-level failure, use `propagate()` (sets `cause`), never swallow it.
+  and MCP tools return `ToolResult<T>` (`src/domain/errors.ts`).
 - **Idempotency for anything money-moving.** `process_refund` requires an
-  idempotencyKey and the mock backend must never create a duplicate refund
-  for a replayed key. Don't "fix" a failing idempotency test by relaxing the
-  replay check — fix the actual bug.
-- **No weakening safeguards to pass a test.** If a test for
-  `src/agent/hooks.ts`, `src/agent/validation.ts`, or the payments mock's
-  balance/currency checks is failing, the fix is almost never to loosen the
-  check. Assume the check is correct until proven otherwise.
-- **Test coverage.** New tools, hooks, or validators need tests in `test/`
-  covering both the success path and at least one structured-failure path.
+  idempotencyKey; `src/approvals/execute.ts` derives it deterministically
+  (`${caseId}:${actionId}:v${actionVersion}`) rather than trusting a
+  model-supplied value. Don't "fix" a failing idempotency test by relaxing
+  the replay check.
+- **No weakening safeguards to pass a test.** If a test for `src/mcp/
+  authorization.ts`, `src/agent/hooks.ts`, `src/agent/validation.ts`, or the
+  payments mock's balance/currency checks is failing, the fix is almost
+  never to loosen the check.
+- **MCP output must exactly match its declared `outputShape`.** The MCP SDK
+  validates `structuredContent` against the registered output schema with
+  `additionalProperties: false` once a client has called `listTools()` —
+  returning an extra field (even a useful one) causes a hard rejection at
+  the protocol layer. Every handler in `toolDefinitions.ts` must return
+  exactly the fields declared in its `outputShape`, no more.
+- **Test coverage.** New tools, hooks, validators, or approval-workflow
+  changes need tests in `tests/` covering both the success path and at
+  least one structured-failure path.
 
-## Agent architecture rules
+## Suggestion packets, hashes, and approval
 
-- The coordinator (`src/agent/coordinator.ts`) never calls a backend tool
-  directly for customer-specific data — it delegates to the four subagents
-  (`delegate_to_identity_subagent`, `delegate_to_order_subagent`,
-  `delegate_to_policy_subagent`, `delegate_to_refund_subagent`).
-- Read-only, independent delegations (Order + Policy) may run in parallel;
-  Refund is dependent and side-effecting and must never be parallelized with
-  anything, and must never run before Identity/Order/Policy have returned.
-  This is enforced in `AgentLoop.executeToolUseBlocks` (sequential whenever
-  any tool in a batch is side-effecting) — don't bypass it with a "faster"
-  batching hack.
-- Programmatic safeguards live in `src/agent/hooks.ts` and run BEFORE a tool
-  call reaches MCP. They are not prompts and must not become prompts. If a
-  new side-effecting tool is added, add its enforcement here first.
-- Every case must end in exactly one of `resolve_case` or
-  `escalate_to_human`. If you add a new terminal state, update
-  `src/agent/loop.ts`'s `finalize()` fail-safe path too — a run must never
-  silently end without an auditable outcome.
-
-## MCP conventions (see `src/mcp/CLAUDE.md` for more)
-
-- One tool, one action, one typed input/output, documented boundaries and
-  failure modes. No generic SQL/HTTP escape hatches.
-- Read tools never mutate state; side-effecting tools are marked
-  `sideEffecting: true` in `toolSpecs` and must be blocked in forked/
-  read-only sessions (see `forkGuard` in `toolDefinitions.ts`).
-
-## Security & privacy requirements
-
-- Never expose unmasked customer email/PII beyond what `get_customer`
-  already masks. Don't add a tool that searches customers by name/email.
-- Never bypass `verify_customer_identity` as the sole path to
-  `identityStatus: "verified"`. No tool, hook, or prompt may set it directly.
-- Escalation packets and case events are audit records — don't add a
-  delete/update-in-place path for them (append-only).
+Every advisor recommendation is a `SuggestionPacket`
+(`src/domain/schemas/suggestionPacket.ts`): versioned, with a
+`suggestionHash` and per-action `actionHash` computed over canonical
+(sorted-key) JSON of the packet's substantive content — never over
+timestamps. A human's approval (`src/approvals/decide.ts`) is bound to an
+*exact* hash + version; editing an action's type or any field inside its
+`parameters` bumps its version, recomputes its hash, and resets it to
+`awaiting_approval` — the prior approval record no longer matches and
+cannot authorize execution. See `docs/human-approval.md` for the full
+lifecycle.
 
 ## Escalation rules
 
 See `mercury://playbook/escalation-criteria` (an MCP resource,
-`src/mcp/resourceDefinitions.ts`) for the authoritative, versioned list.
-Summary: unverified/locked identity, amount at/above the mandatory
-escalation threshold, low/conflicting/stale policy confidence, currency
-mismatch, balance exceeded, and exhausted tool retries all require
-escalation — never autonomous resolution.
+`src/mcp/resourceDefinitions.ts`) for the routing rules, and
+`mercury://reference/advisor-permissions` for the permission summary.
+Unverified/locked identity, low/conflicting/stale policy confidence,
+currency mismatch, a balance/threshold conflict, and exhausted tool retries
+all require `escalate_to_human` — never a submitted suggestion packet.
+
+## Plan-first vs. direct-execution
+
+**Plan-first** (write a reviewed plan before implementing): refund-
+eligibility or policy-evaluation logic changes, authorization changes
+(anything in `src/mcp/authorization.ts` or `src/domain/roles.ts`), MCP tool
+contract changes, breaking schema changes, approval-model changes,
+session/audit-model changes, broad cross-component refactors.
+
+**Direct execution** (implement directly, with focused tests): typo fixes,
+narrow prompt wording improvements, additional few-shot examples, focused
+test additions, non-contractual documentation corrections.
 
 ## Testing requirements
 
-- `npm test` (vitest) must pass with zero `ANTHROPIC_API_KEY` set — all
-  tests use `FakeClaudeClient` or call mock backends/hooks/validators
+- `npm test` (vitest) must pass with zero `ANTHROPIC_API_KEY` set — every
+  test uses `FakeClaudeClient` or calls mock backends/hooks/validators
   directly. If you add a test that needs the live API, gate it behind
   `process.env.MERCURY_ENABLE_LIVE_API_TESTS === "1"` and skip otherwise.
-- `npm run eval` must keep passing 13/13. If you change mock data or policy
-  logic, update `src/eval/scenarios.ts` expectations deliberately — don't
-  adjust an assertion just to make a red run green without understanding why
-  it changed.
+- `npm run typecheck` must be clean.
+- `npm run governance:ci` runs the deterministic (and, if the `claude` CLI
+  is present, model-assisted) governance checks locally.
 
 ## Definition of done for a change here
 
 1. `npm run typecheck` clean.
 2. `npm test` passes.
-3. `npm run eval` still reports the expected pass count (document any
-   intentional change).
-4. No safeguard (hooks, validation, thresholds) was loosened without an
-   explicit instruction from the user to do so.
-5. New tools/resources documented with description, boundaries, and example
+3. No safeguard (role checks, hash checks, hooks, validation, thresholds)
+   was loosened without an explicit instruction from the user to do so.
+4. New tools/resources documented with description, boundaries, and example
    usage, consistent with the existing ones in `toolDefinitions.ts`.
+5. Tests and docs updated alongside the change, not left for later.
+
+## Protected / generated paths
+
+- `.governance/prior-findings.json` is generated by `npm run governance:ci`
+  and gitignored — never hand-edit it.
+- `docs/track2-baseline.md` records a point-in-time fact about the Track 1
+  clone; do not "correct" it to match later development — if it's wrong,
+  that's a sign something about the clone record itself needs fixing, not
+  the file's content.

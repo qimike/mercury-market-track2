@@ -3,14 +3,18 @@
  * currency matches, and — critically — that every citation/transaction id a
  * structured output claims was actually retrieved this case, not fabricated.
  * Schema validation (shape, types, enums) already happened at the MCP layer
- * before this runs; this module is the second, semantic gate described in
- * spec section 12.
+ * before this runs; this module is the second, semantic gate (spec sections
+ * 18-19), applied to the advisor's SuggestionPacket/EscalationPacket/
+ * AdvisorCaseFacts outputs. It never authorizes execution by itself — that's
+ * a separate, later revalidation in src/approvals/revalidate.ts, run again
+ * immediately before `process_refund`/`create_return` actually execute.
  */
 
-import type { Resolution, EscalationPacket, CaseFacts } from "../domain/schemas.js";
+import type { EscalationPacket } from "../domain/schemas.js";
+import type { SuggestionPacket, ProposedAction } from "../domain/schemas/suggestionPacket.js";
+import type { AdvisorCaseFacts } from "../domain/schemas/advisorCaseFacts.js";
 import type { CaseContext } from "./context.js";
 import { parseMoney, compareMoney, sumMoney, formatMoney } from "../domain/money.js";
-import { config } from "../domain/config.js";
 
 export interface FieldError {
   path: string;
@@ -42,56 +46,104 @@ function citationsAreTraceable(
   return errors;
 }
 
-export function validateResolution(resolution: Resolution, ctx: CaseContext): SemanticValidationResult {
+function moneyLikeAction(action: ProposedAction): { amount: string; currency: string; lineItems?: Array<{ lineTotal: string | { amount: string } }> } | null {
+  if (action.actionType !== "propose_refund" && action.actionType !== "initiate_return") return null;
+  const params = action.parameters as Record<string, unknown>;
+  if (typeof params.amount !== "string" || typeof params.currency !== "string") return null;
+  return { amount: params.amount, currency: params.currency, lineItems: params.lineItems as any };
+}
+
+/**
+ * Validates a SuggestionPacket before it may be accepted as the advisor's
+ * terminal output (Pass 5). Never runs during Pass 7 execution — that's
+ * src/approvals/revalidate.ts's job, against fresh tool data.
+ */
+export function validateSuggestionPacket(packet: SuggestionPacket, ctx: CaseContext): SemanticValidationResult {
   const errors: FieldError[] = [];
 
-  if (ctx.identityStatus !== "verified") {
-    errors.push({ path: "outcome", message: "Cannot resolve_case autonomously without a verified identity." });
+  errors.push(...citationsAreTraceable(packet.policyCitations, ctx, "policyCitations"));
+
+  // Precision-review invariant (spec Example B): an issue may never claim
+  // definite (or partial) eligibility without at least one policy citation
+  // backing it — "unsupported certainty" is a blocking finding, not a style note.
+  packet.issues.forEach((issue, i) => {
+    if ((issue.decision === "eligible" || issue.decision === "partially_eligible") && issue.policyCitationReferences.length === 0) {
+      errors.push({
+        path: `issues[${i}].decision`,
+        message: `Issue "${issue.issueId}" claims decision "${issue.decision}" with zero policyCitationReferences — eligibility must be evidence-backed, not asserted.`,
+      });
+    }
+  });
+
+  if (packet.policyCitations.length > 0 && packet.dataProvenance.length === 0) {
+    errors.push({ path: "dataProvenance", message: "Policy citations are present but dataProvenance is empty." });
   }
 
-  errors.push(...citationsAreTraceable(resolution.policyCitations, ctx, "policyCitations"));
+  const seenOrderTargets = new Map<string, string[]>(); // orderId -> actionIds proposing a refund against it
+  for (const [i, action] of packet.proposedActions.entries()) {
+    if (!action.requiresHumanApproval) {
+      errors.push({ path: `proposedActions[${i}].requiresHumanApproval`, message: "Every proposed action must require human approval in Track 2." });
+    }
 
-  if (resolution.refundAmount) {
-    const parsed = parseMoney(resolution.refundAmount.amount, resolution.refundAmount.currency);
-    if (parsed.ok) {
-      const limit = config.mandatoryEscalationLimit(parsed.value.currency);
-      if (compareMoney(parsed.value, limit) >= 0) {
+    const moneyLike = moneyLikeAction(action);
+    if (!moneyLike) continue;
+
+    const parsedAmount = parseMoney(moneyLike.amount, moneyLike.currency);
+    if (!parsedAmount.ok) {
+      errors.push({ path: `proposedActions[${i}].parameters.amount`, message: parsedAmount.error.message });
+      continue;
+    }
+    if (parsedAmount.value.minorUnits < 0) {
+      errors.push({ path: `proposedActions[${i}].parameters.amount`, message: "Proposed amount must be non-negative." });
+    }
+    if (ctx.currency && parsedAmount.value.currency !== ctx.currency) {
+      errors.push({
+        path: `proposedActions[${i}].parameters.currency`,
+        message: `Proposed currency "${parsedAmount.value.currency}" does not match the case's currency "${ctx.currency}".`,
+      });
+    }
+    if (ctx.knownRemainingRefundableAmount) {
+      const known = parseMoney(ctx.knownRemainingRefundableAmount.amount, ctx.knownRemainingRefundableAmount.currency);
+      if (known.ok && known.value.currency === parsedAmount.value.currency && compareMoney(parsedAmount.value, known.value) > 0) {
         errors.push({
-          path: "refundAmount",
-          message: `Refund amount ${resolution.refundAmount.amount} ${resolution.refundAmount.currency} is at/above ` +
-            `the mandatory escalation limit and cannot be part of an autonomous resolution.`,
+          path: `proposedActions[${i}].parameters.amount`,
+          message: `Proposed amount ${moneyLike.amount} ${moneyLike.currency} exceeds the known remaining refundable balance of ${ctx.knownRemainingRefundableAmount.amount} ${ctx.knownRemainingRefundableAmount.currency}.`,
         });
       }
     }
-    // Defense in depth: process_refund's own hook (hooks.ts's runRefundHooks) already
-    // requires decision eligible/partially_eligible at confidence "high" before a refund
-    // can execute, but a resolve_case claiming a refund is re-checked here too.
-    const eligibleDecisions = new Set(["eligible", "partially_eligible"]);
-    if (!ctx.policyDecision || !eligibleDecisions.has(ctx.policyDecision) || ctx.policyConfidence !== "high") {
+    if (Array.isArray(moneyLike.lineItems) && moneyLike.lineItems.length > 0) {
+      const total = moneyLike.lineItems.reduce((sum, li) => {
+        const lineTotal = typeof li.lineTotal === "string" ? li.lineTotal : li.lineTotal.amount;
+        const parsed = parseMoney(lineTotal, moneyLike.currency);
+        return sum + (parsed.ok ? parsed.value.minorUnits : 0);
+      }, 0);
+      if (total !== parsedAmount.value.minorUnits) {
+        errors.push({
+          path: `proposedActions[${i}].parameters.lineItems`,
+          message: `Line item totals (${formatMoney({ currency: moneyLike.currency, minorUnits: total })}) do not sum to the proposed amount (${moneyLike.amount}).`,
+        });
+      }
+    }
+
+    const params = action.parameters as Record<string, unknown>;
+    if (typeof params.orderId === "string") {
+      const list = seenOrderTargets.get(params.orderId) ?? [];
+      list.push(action.actionId);
+      seenOrderTargets.set(params.orderId, list);
+    }
+  }
+
+  for (const [orderId, actionIds] of seenOrderTargets) {
+    if (actionIds.length > 1) {
       errors.push({
-        path: "refundAmount",
-        message:
-          `A refundAmount is claimed but this case's policy decision/confidence ` +
-          `(${ctx.policyDecision ?? "none"}/${ctx.policyConfidence ?? "none"}) does not support an ` +
-          `autonomous refund.`,
+        path: "proposedActions",
+        message: `Multiple proposed money-moving actions (${actionIds.join(", ")}) target the same order "${orderId}" — this looks like duplicate compensation for the same loss; the cross-issue integration pass must resolve this before the packet may be submitted.`,
       });
     }
-    if (!resolution.refundTransactionId) {
-      errors.push({
-        path: "refundTransactionId",
-        message: "refundAmount was provided but refundTransactionId is null — a refund must have executed first.",
-      });
-    } else if (!ctx.seenTransactionIds.has(resolution.refundTransactionId)) {
-      errors.push({
-        path: "refundTransactionId",
-        message: `Transaction "${resolution.refundTransactionId}" does not match any process_refund result seen this case.`,
-      });
-    }
-  } else if (resolution.refundTransactionId) {
-    errors.push({
-      path: "refundAmount",
-      message: "refundTransactionId was provided but refundAmount is null.",
-    });
+  }
+
+  if (packet.review.status === "blocked") {
+    errors.push({ path: "review.status", message: "A packet with review.status \"blocked\" may not be submitted — resolve the blocking findings first." });
   }
 
   return errors.length === 0 ? { valid: true } : { valid: false, errors };
@@ -123,55 +175,38 @@ export function validateEscalationPacket(packet: EscalationPacket, ctx: CaseCont
   return errors.length === 0 ? { valid: true } : { valid: false, errors };
 }
 
-/**
- * Validates CaseFacts submitted via record_case_facts. Implements the spec's
- * named example invariant: `line_item_refund_sum == requested_refund_total`
- * — when a requestedAmount and line items are both present, the line items'
- * total must equal the requested amount (a customer can't be recorded as
- * requesting $80 while the line items on the case only sum to $45).
- */
-export function validateCaseFacts(facts: CaseFacts): SemanticValidationResult {
+/** Validates AdvisorCaseFacts submitted via record_case_facts (Pass 1 output). */
+export function validateAdvisorCaseFacts(facts: AdvisorCaseFacts): SemanticValidationResult {
   const errors: FieldError[] = [];
 
-  if (facts.requestedAmount && facts.lineItems.length > 0) {
-    const currency = facts.requestedAmount.currency;
-    const sameCurrencyItems = facts.lineItems.filter((li) => li.lineTotal.currency === currency);
-    if (sameCurrencyItems.length !== facts.lineItems.length) {
-      errors.push({
-        path: "lineItems",
-        message: `All line items must be in the case currency "${currency}" to validate against requestedAmount.`,
-      });
-    } else {
-      const lineItemSum = sumMoney(
-        sameCurrencyItems.map((li) => ({ currency: li.lineTotal.currency, minorUnits: parseMoneyOrZero(li.lineTotal) })),
-        currency
-      );
-      const requested = parseMoney(facts.requestedAmount.amount, facts.requestedAmount.currency);
-      if (requested.ok && formatMoney(lineItemSum) !== formatMoney(requested.value)) {
-        errors.push({
-          path: "requestedAmount",
-          message:
-            `requestedAmount (${facts.requestedAmount.amount} ${currency}) does not equal the sum of ` +
-            `lineItems' lineTotal (${formatMoney(lineItemSum)} ${currency}).`,
-        });
-      }
+  if (facts.requestedAmount && facts.eligibleAmount) {
+    const requested = parseMoney(facts.requestedAmount.amount, facts.requestedAmount.currency);
+    const eligible = parseMoney(facts.eligibleAmount.amount, facts.eligibleAmount.currency);
+    if (requested.ok && eligible.ok && requested.value.currency !== eligible.value.currency) {
+      errors.push({ path: "eligibleAmount", message: "eligibleAmount currency must match requestedAmount currency." });
     }
   }
+
+  const statementIds = new Set(facts.statements.map((s) => s.statementId));
+  facts.unresolvedContradictions.forEach((c, i) => {
+    c.conflictingStatementIds.forEach((id) => {
+      if (!statementIds.has(id)) {
+        errors.push({ path: `unresolvedContradictions[${i}]`, message: `References unknown statementId "${id}".` });
+      }
+    });
+  });
 
   return errors.length === 0 ? { valid: true } : { valid: false, errors };
 }
 
-function parseMoneyOrZero(m: { amount: string; currency: string }): number {
-  const parsed = parseMoney(m.amount, m.currency);
-  return parsed.ok ? parsed.value.minorUnits : 0;
-}
-
-/** Formats field errors into a message Claude can act on directly, per-field. */
+/** Formats field errors into a message the model can act on directly, per-field. */
 export function formatValidationErrorsForClaude(toolName: string, errors: FieldError[]): string {
   const lines = errors.map((e) => `- ${e.path}: ${e.message}`).join("\n");
   return (
     `Validation failed for ${toolName}. Fix exactly these fields and call ${toolName} again with the ` +
-    `same caseId — do not repeat any side-effecting tool calls (process_refund, create_return, ` +
-    `verify_customer_identity) while correcting this output:\n${lines}`
+    `same caseId — do not repeat any side-effecting tool calls (verify_customer_identity, escalate_to_human) ` +
+    `while correcting this output:\n${lines}`
   );
 }
+
+export { sumMoney };

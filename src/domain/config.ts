@@ -28,28 +28,43 @@ export const SUPPORTED_CURRENCIES = ["USD", "EUR", "GBP", "CAD", "AUD"] as const
 export type Currency = (typeof SUPPORTED_CURRENCIES)[number];
 
 export interface MercuryConfig {
-  /** Refunds at/below this amount MAY be processed autonomously (subject to identity + policy confidence). */
-  autonomousRefundLimit: (currency: string) => Money;
-  /** Refunds at/above this amount ALWAYS require human escalation, no exceptions. */
-  mandatoryEscalationLimit: (currency: string) => Money;
-  maxLoopIterations: number;
-  maxToolRetries: number;
+  /**
+   * Advisory ceiling used only to flag a proposed refund as high-risk for
+   * the precision review pass (spec section 6/14, MERCURY_REFUND_LIMIT_USD).
+   * Track 2 has no autonomous execution path, so this never authorizes a
+   * refund by itself — it only feeds risk classification and the human
+   * approval gate's "requires 2 approvals" tier (src/approvals/decide.ts).
+   */
+  refundLimit: (currency: string) => Money;
+  /** Per-issue confidence below this triggers a "low confidence" precision-review flag (section 14). */
+  advisorConfidenceThreshold: number;
+  maxAgentSteps: number;
+  maxRetries: number;
   maxOutputRetries: number;
   enableLiveApiTests: boolean;
   model: string;
+  env: string;
+  dbPath: string;
+  logLevel: string;
 }
 
-const autonomousRefundLimitDecimal = envDecimal("MERCURY_AUTONOMOUS_REFUND_LIMIT", "150.00");
-const mandatoryEscalationLimitDecimal = envDecimal("MERCURY_MANDATORY_ESCALATION_LIMIT", "500.00");
+const refundLimitDecimal = envDecimal("MERCURY_REFUND_LIMIT_USD", "150.00");
 
 export const config: MercuryConfig = {
-  autonomousRefundLimit: (currency: string) => money(autonomousRefundLimitDecimal, currency),
-  mandatoryEscalationLimit: (currency: string) => money(mandatoryEscalationLimitDecimal, currency),
-  maxLoopIterations: envInt("MERCURY_MAX_LOOP_ITERATIONS", 12),
-  maxToolRetries: envInt("MERCURY_MAX_TOOL_RETRIES", 2),
+  refundLimit: (currency: string) => money(refundLimitDecimal, currency),
+  advisorConfidenceThreshold: (() => {
+    const raw = process.env.MERCURY_ADVISOR_CONFIDENCE_THRESHOLD;
+    const parsed = raw ? Number.parseFloat(raw) : NaN;
+    return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0.75;
+  })(),
+  maxAgentSteps: envInt("MERCURY_MAX_AGENT_STEPS", 12),
+  maxRetries: envInt("MERCURY_MAX_RETRIES", 2),
   maxOutputRetries: envInt("MERCURY_MAX_OUTPUT_RETRIES", 2),
   enableLiveApiTests: process.env.MERCURY_ENABLE_LIVE_API_TESTS === "1",
   model: process.env.MERCURY_MODEL ?? "claude-sonnet-4-5",
+  env: process.env.MERCURY_ENV ?? "development",
+  dbPath: process.env.MERCURY_DB_PATH ?? ":memory:",
+  logLevel: process.env.MERCURY_LOG_LEVEL ?? "info",
 };
 
 export function isSupportedRegion(region: string): region is Region {

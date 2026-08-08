@@ -60,7 +60,7 @@ export async function runSubagentLoop<T>(options: {
   let iteration = 0;
   while (true) {
     iteration += 1;
-    if (iteration > config.maxLoopIterations) {
+    if (iteration > config.maxAgentSteps) {
       return { finding: null, outcome: "max_iterations_exceeded", iterations: iteration, trace };
     }
 

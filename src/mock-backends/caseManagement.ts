@@ -1,12 +1,16 @@
 /**
- * Mock case-management system. Backs `get_case_history`, `record_case_event`,
- * and the storage side of `escalate_to_human`. In-memory only; a real
+ * Mock case-management system. Backs `get_case_history` and
+ * `record_case_event` (append-only audit log) plus storage of the advisor's
+ * structured case-facts snapshot. Escalation queue storage lives in
+ * `approvalQueue.ts` (spec section 11: escalate_to_human is now a typed
+ * queue write, not a terminal "case closed" record) and suggestion-packet
+ * storage lives in `src/governance/packetStore.ts`. In-memory only; a real
  * deployment would swap this for the actual case-management datastore.
  */
 
 import { caseEvents, type CaseEventRecord } from "./data.js";
 import { ok, fail, type ToolResult } from "../domain/errors.js";
-import type { EscalationPacket, Resolution, CaseFacts } from "../domain/schemas.js";
+import type { AdvisorCaseFacts } from "../domain/schemas/advisorCaseFacts.js";
 
 export interface CaseHistory {
   events: CaseEventRecord[];
@@ -31,74 +35,19 @@ export async function recordCaseEvent(
   return ok({ event });
 }
 
-interface StoredEscalation {
-  escalationId: string;
-  packet: EscalationPacket;
-  createdAt: string;
-}
+const caseFactsStore = new Map<string, AdvisorCaseFacts>();
 
-const escalations = new Map<string, StoredEscalation>();
-let escalationSeq = 0;
-
-export async function escalateToHuman(
-  packet: EscalationPacket
-): Promise<ToolResult<{ escalationId: string }>> {
-  escalationSeq += 1;
-  const escalationId = `esc_${String(escalationSeq).padStart(4, "0")}`;
-  const createdAt = new Date().toISOString();
-  escalations.set(escalationId, { escalationId, packet, createdAt });
-  caseEvents.push({
-    caseId: packet.caseId,
-    eventType: "escalated_to_human",
-    summary: packet.escalationReason,
-    actor: "coordinator",
-    createdAt,
-  });
-  return ok({ escalationId });
-}
-
-export function getEscalation(escalationId: string): StoredEscalation | undefined {
-  return escalations.get(escalationId);
-}
-
-export function listEscalations(): StoredEscalation[] {
-  return [...escalations.values()];
-}
-
-const resolutions = new Map<string, Resolution>();
-const caseFactsStore = new Map<string, CaseFacts>();
-
-/** Stores the structured, schema-validated resolution for a case resolved autonomously. */
-export async function recordResolution(resolution: Resolution): Promise<ToolResult<{ acknowledged: true }>> {
-  resolutions.set(resolution.caseId, resolution);
-  caseEvents.push({
-    caseId: resolution.caseId,
-    eventType: "resolved_autonomously",
-    summary: resolution.internalSummary,
-    actor: "coordinator",
-    createdAt: new Date().toISOString(),
-  });
-  return ok({ acknowledged: true });
-}
-
-export function getResolution(caseId: string): Resolution | undefined {
-  return resolutions.get(caseId);
-}
-
-/** Stores the latest structured CaseFacts snapshot submitted for a case. */
-export async function recordCaseFacts(facts: CaseFacts): Promise<ToolResult<{ acknowledged: true }>> {
+/** Stores the latest structured AdvisorCaseFacts snapshot submitted for a case (Pass 1 output). */
+export async function recordCaseFacts(facts: AdvisorCaseFacts): Promise<ToolResult<{ acknowledged: true }>> {
   caseFactsStore.set(facts.caseId, facts);
   return ok({ acknowledged: true });
 }
 
-export function getStoredCaseFacts(caseId: string): CaseFacts | undefined {
+export function getStoredCaseFacts(caseId: string): AdvisorCaseFacts | undefined {
   return caseFactsStore.get(caseId);
 }
 
 export function _resetCaseManagementMockState(): void {
   caseEvents.length = 0;
-  escalations.clear();
-  escalationSeq = 0;
-  resolutions.clear();
   caseFactsStore.clear();
 }

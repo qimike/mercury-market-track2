@@ -6,3 +6,6 @@ dist/
 logs/
 coverage/
 .DS_Store
+.governance/
+.claude/worktrees/
+.mercury-state/
